@@ -30,6 +30,7 @@ mkdir data
 - Download the metadata.csv from [here](https://physionet.org/content/vindr-mammo/1.0.0/).
 - Store the dataset in the following way inside the project directory:
 
+```
 Health-Cryption/
 ├─ data/
 │  ├─ images_png/...
@@ -40,7 +41,8 @@ Health-Cryption/
 ├─ Other Python Codes
 ├─ .gitignore
 ├─ requirements.txt
-└─ README.md  
+└─ README.md
+```
 
 ## 6) Create a virtual environment (myenv)
 You may rename the virtual environment as anything you like.
