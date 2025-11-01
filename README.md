@@ -16,7 +16,7 @@ git clone https://github.com/RaiyanJahangir/Health-Cryption.git
 
 ## 3) Go to the root directory of the project
 ```
-cd Dataset-Recommender
+cd Health-Cryption
 ```
 
 ## 4) Create a directory to store the data
