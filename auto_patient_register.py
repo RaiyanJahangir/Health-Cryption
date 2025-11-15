@@ -28,12 +28,13 @@ from passlib.hash import argon2
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from db import SessionLocal
-from models import Patient, Doctor, PatientDoctorAccess
+from db import SessionLocal, PlainSessionLocal
+from models import Patient, Doctor, PatientDoctorAccess, PlainPatient
 from crypto import (
     scrypt_kdf, aesgcm_encrypt, random_key32,
     sealed_box_encrypt,
 )
+from plain_sync import ensure_plain_patient, update_plain_patient_fields, set_plain_patient_image
 
 # ---------- CONFIG PATHS ----------
 ROOT = Path(".").resolve()
@@ -47,12 +48,12 @@ CRED_LOG = ROOT / "data" / "auto_patient_credentials.csv"
 
 USER_RE = re.compile(r"^patient(\d+)$")
 
-def get_next_patient_counter(db: Session) -> int:
+def get_next_patient_counter(plain_db: Session) -> int:
     """
     Scan existing patient user_ids of the form 'patientN' and return max(N)+1, or 1 if none.
     """
     # Pull all user_ids to avoid dialect-dependent regex support
-    rows = db.query(Patient.user_id).all()
+    rows = plain_db.query(PlainPatient.user_id).all()
     max_n = 0
     for (uid,) in rows:
         if not uid:
@@ -67,14 +68,14 @@ def get_next_patient_counter(db: Session) -> int:
                 pass
     return max_n + 1
 
-def next_free_user_id(db: Session, start_n: int) -> tuple[str, int]:
+def next_free_user_id(plain_db: Session, start_n: int) -> tuple[str, int]:
     """
     Starting from start_n, find the first 'patient{n}' not used. Return (user_id, n).
     """
     n = start_n
     while True:
         uid = f"patient{n}"
-        exists = db.query(Patient).filter_by(user_id=uid).first()
+        exists = plain_db.query(PlainPatient).filter_by(user_id=uid).first()
         if not exists:
             return uid, n
         n += 1
@@ -230,18 +231,17 @@ def main():
         sys.exit(1)
 
     created_creds = []  # list of (patient_id, user_id, password)
-    with SessionLocal() as db_probe:
-        counter = get_next_patient_counter(db_probe)
+    with PlainSessionLocal() as plain_probe:
+        counter = get_next_patient_counter(plain_probe)
 
-
-    with SessionLocal() as db:
+    with SessionLocal() as db, PlainSessionLocal() as plain_db:
         # Iterate subfolders (study_id)
         for study_dir in sorted(IMG_ROOT.iterdir()):
             if not study_dir.is_dir():
                 continue
             study_id = study_dir.name.strip()
             # Skip if patient already exists
-            if db.query(Patient).filter_by(patient_id=study_id).first():
+            if plain_db.query(PlainPatient).filter_by(patient_id=study_id).first():
                 print(f"[SKIP] patient_id already exists: {study_id}")
                 continue
 
@@ -272,19 +272,35 @@ def main():
                 findings = None
 
             # Create patient account with generated creds
-            user_id, counter = next_free_user_id(db, counter)
+            user_id, counter = next_free_user_id(plain_db, counter)
             password = f"pass{counter}"
+            password_hash = argon2.hash(password)
 
             patient_key = random_key32()
             salt_p = os.urandom(16)
             k_p = scrypt_kdf(password, salt_p, 32)
             nonce_p, ct_p = aesgcm_encrypt(k_p, patient_key)
 
-            p_row = Patient(
+            plain_row = ensure_plain_patient(
+                plain_db,
                 patient_id=study_id,
                 user_id=user_id,
-                password_hash=argon2.hash(password),
-                role="patient",
+                name=study_id,
+                age=None,
+                password_hash=password_hash,
+            )
+            pid_nonce, pid_ct = encrypt_field(patient_key, study_id, "patient_id")
+            uid_nonce, uid_ct = encrypt_field(patient_key, user_id, "user_id")
+            pw_nonce, pw_ct = encrypt_field(patient_key, password_hash, "password_hash")
+
+            p_row = Patient(
+                plain_id=plain_row.id,
+                patient_id_ct=pid_ct,
+                patient_id_nonce=pid_nonce,
+                user_id_ct=uid_ct,
+                user_id_nonce=uid_nonce,
+                password_hash_ct=pw_ct,
+                password_hash_nonce=pw_nonce,
                 enc_data_key_for_patient=ct_p,
                 enc_data_key_for_patient_nonce=nonce_p,
                 enc_data_key_for_patient_salt=salt_p,
@@ -294,13 +310,35 @@ def main():
                 db.commit()  # obtain p_row.id
             except Exception:
                 db.rollback()
-                # Extremely unlikely race/collision—try the next free id once more
-                user_id, counter = next_free_user_id(db, counter + 1)
+                user_id, counter = next_free_user_id(plain_db, counter + 1)
                 password = f"pass{counter}"
-                p_row.user_id = user_id
-                p_row.password_hash = argon2.hash(password)
+                password_hash = argon2.hash(password)
+                plain_row = ensure_plain_patient(
+                    plain_db,
+                    patient_id=study_id,
+                    user_id=user_id,
+                    name=study_id,
+                    password_hash=password_hash,
+                )
+                pid_nonce, pid_ct = encrypt_field(patient_key, study_id, "patient_id")
+                uid_nonce, uid_ct = encrypt_field(patient_key, user_id, "user_id")
+                pw_nonce, pw_ct = encrypt_field(patient_key, password_hash, "password_hash")
+                p_row = Patient(
+                    plain_id=plain_row.id,
+                    patient_id_ct=pid_ct,
+                    patient_id_nonce=pid_nonce,
+                    user_id_ct=uid_ct,
+                    user_id_nonce=uid_nonce,
+                    password_hash_ct=pw_ct,
+                    password_hash_nonce=pw_nonce,
+                    enc_data_key_for_patient=ct_p,
+                    enc_data_key_for_patient_nonce=nonce_p,
+                    enc_data_key_for_patient_salt=salt_p,
+                )
                 db.add(p_row)
                 db.commit()
+            plain_row.secure_id = p_row.id
+            plain_db.commit()
 
             # Fill textual fields (age will be taken from image metadata; if inconsistent across 4 images, first non-null wins)
             decided_age = None
@@ -331,6 +369,13 @@ def main():
                 nonce_img, ct_img = aesgcm_encrypt(patient_key, blob, aad=aad_map[slot].encode())
                 set_image_on_patient(p_row, slot, nonce_img, ct_img, mime="image/png")
                 slots_set.add(slot)
+                set_plain_patient_image(
+                    plain_db,
+                    patient_id=study_id,
+                    slot=slot,
+                    blob=blob,
+                    mime="image/png",
+                )
 
             # Encrypt text fields using patient_key
             if decided_age:
@@ -343,6 +388,14 @@ def main():
                 p_row.findings_nonce, p_row.findings_ct = encrypt_field(patient_key, findings, "findings")
 
             db.commit()
+            update_plain_patient_fields(
+                plain_db,
+                patient_id=study_id,
+                age=decided_age or None,
+                birads=birads or None,
+                breast_density=density or None,
+                findings=findings or None,
+            )
 
             # Auto-grant to all doctors
             grant_patient_to_all_doctors(db, p_row, patient_key)

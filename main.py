@@ -13,13 +13,21 @@ except ImportError:
 from passlib.hash import argon2
 from sqlalchemy.orm import Session
 
-from db import SessionLocal
-from models import Patient, Doctor, PatientDoctorAccess
+from db import SessionLocal, PlainSessionLocal
+from models import Patient, Doctor, PatientDoctorAccess, PlainPatient, PlainDoctor
 from crypto import (
     scrypt_kdf, aesgcm_encrypt, aesgcm_decrypt, random_key32,
     x25519_generate, protect_privkey_with_password, unprotect_privkey_with_password,
     sealed_box_encrypt, sealed_box_decrypt
 )
+from plain_sync import (
+    ensure_plain_patient,
+    update_plain_patient_fields,
+    set_plain_patient_image,
+    clear_plain_patient_image,
+    ensure_plain_doctor,
+)
+from config import SECURE_DB_PATH, PLAIN_DB_PATH
 
 # ---------- basic io ----------
 def input_safe(prompt: str) -> str:
@@ -27,6 +35,20 @@ def input_safe(prompt: str) -> str:
 
 def input_password(prompt: str) -> str:
     return getpass.getpass(prompt)
+
+
+def next_patient_identifier(plain_db: Session) -> str:
+    idx = plain_db.query(PlainPatient).count() + 1
+    while plain_db.query(PlainPatient).filter_by(patient_id=f"patient{idx}").first():
+        idx += 1
+    return f"patient{idx}"
+
+
+def next_doctor_identifier(plain_db: Session) -> str:
+    idx = plain_db.query(PlainDoctor).count() + 1
+    while plain_db.query(PlainDoctor).filter_by(doctor_id=f"doctor{idx}").first():
+        idx += 1
+    return f"doctor{idx}"
 
 def fetch_bytes_from_link(link: str) -> bytes:
     p = Path(link)
@@ -112,10 +134,11 @@ def clear_image_on_patient(p: Patient, slot: str):
         raise ValueError("Invalid image slot")
 
 def view_patient_decrypted(p: Patient, patient_key: bytes, selective=False):
-    show_age = show_birads = show_density = show_findings = show_images = True
+    show_name = show_age = show_birads = show_density = show_findings = show_images = True
     if selective:
         def yn(q): 
             return input_safe(q + " [y/N]: ").strip().lower().startswith("y")
+        show_name = yn("Show name?")
         show_age = yn("Show age?")
         show_birads = yn("Show BIRADS?")
         show_density = yn("Show breast density?")
@@ -123,7 +146,11 @@ def view_patient_decrypted(p: Patient, patient_key: bytes, selective=False):
         show_images = yn("Show images (showing cipher length/mime/tags only)?")
 
     print("\n=== Decrypted View ===")
-    print(f"Patient ID: {p.patient_id} | Login user_id: {p.user_id}")
+    pid_plain = decrypt_field(patient_key, p.patient_id_nonce, p.patient_id_ct, aad="patient_id")
+    uid_plain = decrypt_field(patient_key, p.user_id_nonce, p.user_id_ct, aad="user_id")
+    print(f"Patient ID: {pid_plain} | Login user_id: {uid_plain}")
+    if show_name:
+        print("Name:", decrypt_field(patient_key, p.name_nonce, p.name_ct, aad="name"))
     if show_age:
         print("Age:", decrypt_field(patient_key, p.age_nonce, p.age_ct, aad="age"))
     if show_birads:
@@ -145,18 +172,34 @@ def view_patient_decrypted(p: Patient, patient_key: bytes, selective=False):
     print("======================\n")
 
 # ---------- account creation ----------
-def create_patient_account(db: Session):
+def create_patient_account(db: Session, plain_db: Session):
     print("\n-- Create Patient Account --")
-    patient_id = input_safe("Enter unique patient_id: ").strip()
+    patient_id = next_patient_identifier(plain_db)
+    print(f"Assigned patient_id: {patient_id}")
     user_id = input_safe("Choose your login user_id: ").strip()
+    full_name = input_safe("Enter patient's full name: ").strip()
+    age = input_safe("Enter patient's age (blank=skip): ").strip()
     password = input_password("Choose a password: ").strip()
 
-    if db.query(Patient).filter_by(user_id=user_id).first():
+    if not full_name:
+        print("Name is required.")
+        return
+    if plain_db.query(PlainPatient).filter_by(user_id=user_id).first():
         print("A patient with that user_id already exists.")
         return
-    if db.query(Patient).filter_by(patient_id=patient_id).first():
+    if plain_db.query(PlainPatient).filter_by(patient_id=patient_id).first():
         print("That patient_id already exists.")
         return
+
+    password_hash = argon2.hash(password)
+    plain_row = ensure_plain_patient(
+        plain_db,
+        patient_id=patient_id,
+        user_id=user_id,
+        name=full_name,
+        age=age or None,
+        password_hash=password_hash,
+    )
 
     # per-patient data key wrapped to patient's password
     patient_key = random_key32()
@@ -164,38 +207,94 @@ def create_patient_account(db: Session):
     k_p = scrypt_kdf(password, salt_p, 32)
     nonce_p, ct_p = aesgcm_encrypt(k_p, patient_key)
 
+    name_nonce, name_ct = encrypt_field(patient_key, full_name, "name")
+    age_nonce, age_ct = encrypt_field(patient_key, age or None, "age")
+    patient_id_nonce, patient_id_ct = encrypt_field(patient_key, patient_id, "patient_id")
+    user_id_nonce, user_id_ct = encrypt_field(patient_key, user_id, "user_id")
+    pw_hash_nonce, pw_hash_ct = encrypt_field(patient_key, password_hash, "password_hash")
+
     row = Patient(
-        patient_id=patient_id,
-        user_id=user_id,
-        password_hash=argon2.hash(password),
-        role="patient",
+        plain_id=plain_row.id,
+        patient_id_ct=patient_id_ct,
+        patient_id_nonce=patient_id_nonce,
+        user_id_ct=user_id_ct,
+        user_id_nonce=user_id_nonce,
+        password_hash_ct=pw_hash_ct,
+        password_hash_nonce=pw_hash_nonce,
+        name_nonce=name_nonce,
+        name_ct=name_ct,
+        age_nonce=age_nonce,
+        age_ct=age_ct,
         enc_data_key_for_patient=ct_p,
         enc_data_key_for_patient_nonce=nonce_p,
         enc_data_key_for_patient_salt=salt_p,
     )
     db.add(row)
     db.commit()
+    plain_row.secure_id = row.id
+    plain_db.commit()
 
     # AUTO-GRANT to all existing doctors (we have the patient's key now)
     grant_patient_to_all_doctors(db, row, patient_key)
     print("Patient account created (granted to all doctors).")
 
-def create_doctor_account(db: Session):
+def create_doctor_account(db: Session, plain_db: Session):
     print("\n-- Create Doctor Account --")
+    doctor_id = next_doctor_identifier(plain_db)
+    print(f"Assigned doctor_id: {doctor_id}")
     user_id = input_safe("Choose doctor user_id: ").strip()
+    full_name = input_safe("Enter doctor's full name: ").strip()
+    age_raw = input_safe("Enter doctor's age: ").strip()
     password = input_password("Choose a password: ").strip()
-    if db.query(Doctor).filter_by(user_id=user_id).first():
+
+    if not full_name:
+        print("Name is required.")
+        return
+    try:
+        age_val = int(age_raw)
+    except ValueError:
+        print("Age must be a number.")
+        return
+    if plain_db.query(PlainDoctor).filter_by(user_id=user_id).first():
         print("A doctor with that user_id already exists.")
+        return
+    if plain_db.query(PlainDoctor).filter_by(doctor_id=doctor_id).first():
+        print("That doctor_id already exists.")
         return
 
     # X25519 keypair; encrypt private key with password
     priv, pub = x25519_generate()
     salt, nonce, enc_priv = protect_privkey_with_password(priv, password)
+    password_hash = argon2.hash(password)
+    plain_row = ensure_plain_doctor(
+        plain_db,
+        doctor_id=doctor_id,
+        user_id=user_id,
+        name=full_name,
+        age=age_val,
+        password_hash=password_hash,
+    )
+    profile_salt = os.urandom(16)
+    profile_key = scrypt_kdf(password, profile_salt, 32)
+    doctor_id_nonce, doctor_id_ct = aesgcm_encrypt(profile_key, doctor_id.encode(), aad=b"doctor_id")
+    user_id_nonce, user_id_ct = aesgcm_encrypt(profile_key, user_id.encode(), aad=b"user_id")
+    pw_hash_nonce, pw_hash_ct = aesgcm_encrypt(profile_key, password_hash.encode(), aad=b"password_hash")
+    name_nonce, name_ct = aesgcm_encrypt(profile_key, full_name.encode(), aad=b"name")
+    age_nonce, age_ct = aesgcm_encrypt(profile_key, str(age_val).encode(), aad=b"age")
 
     row = Doctor(
-        user_id=user_id,
-        password_hash=argon2.hash(password),
-        role="doctor",
+        plain_id=plain_row.id,
+        doctor_id_ct=doctor_id_ct,
+        doctor_id_nonce=doctor_id_nonce,
+        user_id_ct=user_id_ct,
+        user_id_nonce=user_id_nonce,
+        password_hash_ct=pw_hash_ct,
+        password_hash_nonce=pw_hash_nonce,
+        name_ct=name_ct,
+        name_nonce=name_nonce,
+        age_ct=age_ct,
+        age_nonce=age_nonce,
+        profile_salt=profile_salt,
         public_key=bytes(pub),
         enc_private_key=enc_priv,
         enc_private_key_nonce=nonce,
@@ -203,12 +302,14 @@ def create_doctor_account(db: Session):
     )
     db.add(row)
     db.commit()
+    plain_row.secure_id = row.id
+    plain_db.commit()
 
     print("Doctor account created (patients will be accessible; missing grants created on first access if needed).")
 
 # ---------- sessions ----------
-def patient_session(db: Session, p: Patient):
-    print(f"\nWelcome, patient {p.user_id}")
+def patient_session(db: Session, plain_db: Session, p: Patient, plain_patient: PlainPatient):
+    print(f"\nWelcome, patient {plain_patient.name}")
     while True:
         print("1) View my data (selectively)")
         print("2) Add/Update demographics (age, BIRADS, density, findings)")
@@ -234,10 +335,13 @@ def patient_session(db: Session, p: Patient):
             except Exception:
                 print("Wrong password or integrity error.")
                 continue
+            name = input_safe("Full name (blank=skip): ").strip()
             age = input_safe("Age (blank=skip): ").strip()
             birads = input_safe("BIRADS (blank=skip): ").strip()
             density = input_safe("Breast density (blank=skip): ").strip()
             findings = input_safe("Findings (blank=skip): ").strip()
+            if name:
+                p.name_nonce, p.name_ct = aesgcm_encrypt(patient_key, name.encode(), aad=b"name")
             if age:
                 p.age_nonce, p.age_ct = aesgcm_encrypt(patient_key, age.encode(), aad=b"age")
             if birads:
@@ -247,6 +351,16 @@ def patient_session(db: Session, p: Patient):
             if findings:
                 p.findings_nonce, p.findings_ct = aesgcm_encrypt(patient_key, findings.encode(), aad=b"findings")
             db.commit()
+            update_plain_patient_fields(
+                plain_db,
+                patient_id=plain_patient.patient_id,
+                name=name or None,
+                age=age or None,
+                birads=birads or None,
+                breast_density=density or None,
+                findings=findings or None,
+            )
+            plain_db.refresh(plain_patient)
             print("Updated.")
 
         elif choice == "3":
@@ -270,6 +384,13 @@ def patient_session(db: Session, p: Patient):
             nonce, ct = aesgcm_encrypt(patient_key, blob, aad=aad_map[slot].encode())
             set_image_on_patient(p, slot, nonce, ct, mime)
             db.commit()
+            set_plain_patient_image(
+                plain_db,
+                patient_id=plain_patient.patient_id,
+                slot=slot,
+                blob=blob,
+                mime=mime,
+            )
             print("Image saved (encrypted).")
 
         elif choice == "4":
@@ -280,6 +401,7 @@ def patient_session(db: Session, p: Patient):
                 print("Invalid choice.")
                 continue
             db.commit()
+            clear_plain_patient_image(plain_db, patient_id=plain_patient.patient_id, slot=slot)
             print("Removed.")
 
         elif choice == "5":
@@ -288,8 +410,8 @@ def patient_session(db: Session, p: Patient):
         else:
             print("Invalid choice.")
 
-def doctor_session(db: Session, d: Doctor):
-    print(f"\nWelcome, Dr. {d.user_id}")
+def doctor_session(db: Session, plain_db: Session, d: Doctor, plain_doctor: PlainDoctor):
+    print(f"\nWelcome, Dr. {plain_doctor.name}")
     doctor_priv = None  # cache private key for session
     while True:
         print("1) List patients I can access")
@@ -304,16 +426,23 @@ def doctor_session(db: Session, d: Doctor):
             accesses = db.query(PatientDoctorAccess).filter_by(doctor_id=d.id).all()
             if not accesses:
                 print("No sealed entries yet (new doctor). You can still open patients; missing grants will be created on first access.")
-            pats = db.query(Patient).all()
-            for p in pats:
-                flag = "[✓]" if db.query(PatientDoctorAccess).filter_by(patient_id=p.id, doctor_id=d.id).first() else "[ ]"
-                print(f"{flag} patient_id={p.patient_id} (login={p.user_id})")
+            pats = plain_db.query(PlainPatient).all()
+            for plain_p in pats:
+                secure_patient = db.query(Patient).filter_by(plain_id=plain_p.id).first()
+                if not secure_patient:
+                    continue
+                has_access = db.query(PatientDoctorAccess).filter_by(patient_id=secure_patient.id, doctor_id=d.id).first() is not None
+                flag = "[✓]" if has_access else "[ ]"
+                print(f"{flag} patient_id={plain_p.patient_id} (login={plain_p.user_id})")
 
         elif choice in {"2","3","4","5"}:
             pid = input_safe("Enter patient_id: ").strip()
-            p = db.query(Patient).filter_by(patient_id=pid).first()
-            if not p:
+            plain_target = plain_db.query(PlainPatient).filter_by(patient_id=pid).first()
+            if not plain_target or plain_target.secure_id is None:
                 print("Not found."); continue
+            p = db.query(Patient).filter_by(id=plain_target.secure_id).first()
+            if not p:
+                print("Secure record missing."); continue
 
             # unlock doctor's private key if needed
             if doctor_priv is None:
@@ -366,7 +495,16 @@ def doctor_session(db: Session, d: Doctor):
                 if birads: p.birads_nonce, p.birads_ct = aesgcm_encrypt(patient_key, birads.encode(), aad=b"birads")
                 if density: p.breast_density_nonce, p.breast_density_ct = aesgcm_encrypt(patient_key, density.encode(), aad=b"breast_density")
                 if findings: p.findings_nonce, p.findings_ct = aesgcm_encrypt(patient_key, findings.encode(), aad=b"findings")
-                db.commit(); print("Updated.")
+                db.commit()
+                update_plain_patient_fields(
+                    plain_db,
+                    patient_id=plain_target.patient_id,
+                    age=age or None,
+                    birads=birads or None,
+                    breast_density=density or None,
+                    findings=findings or None,
+                )
+                print("Updated.")
 
             elif choice == "4":
                 slot = img_slot_menu()
@@ -381,7 +519,15 @@ def doctor_session(db: Session, d: Doctor):
                     print("Invalid choice."); continue
                 nonce, ct = aesgcm_encrypt(patient_key, blob, aad=aad_map[slot].encode())
                 set_image_on_patient(p, slot, nonce, ct, mime)
-                db.commit(); print("Image saved (encrypted).")
+                db.commit()
+                set_plain_patient_image(
+                    plain_db,
+                    patient_id=plain_target.patient_id,
+                    slot=slot,
+                    blob=blob,
+                    mime=mime,
+                )
+                print("Image saved (encrypted).")
 
             elif choice == "5":
                 slot = img_slot_menu()
@@ -389,7 +535,9 @@ def doctor_session(db: Session, d: Doctor):
                     clear_image_on_patient(p, slot)
                 except Exception:
                     print("Invalid choice."); continue
-                db.commit(); print("Removed.")
+                db.commit()
+                clear_plain_patient_image(plain_db, patient_id=plain_target.patient_id, slot=slot)
+                print("Removed.")
 
         elif choice == "6":
             print("Logged out.")
@@ -400,7 +548,8 @@ def doctor_session(db: Session, d: Doctor):
 # ---------- main ----------
 def main():
     print("=== Secure CLI (SQLite + AES-GCM + per-doctor X25519) ===")
-    print(f"DB path: {Path(os.getcwd()) / 'data' / 'secure_health.db'}")
+    print(f"Encrypted DB path: {SECURE_DB_PATH.resolve()}")
+    print(f"Plaintext mirror path: {PLAIN_DB_PATH.resolve()}")
     while True:
         print("\n1) Login")
         print("2) Create patient account")
@@ -409,27 +558,33 @@ def main():
         cmd = input_safe("Choose: ").strip()
 
         if cmd == "1":
-            with SessionLocal() as db:
+            with SessionLocal() as db, PlainSessionLocal() as plain_db:
                 uid = input_safe("user_id: ").strip()
                 pw = input_password("password: ").strip()
 
-                p = db.query(Patient).filter_by(user_id=uid).first()
-                if p and argon2.verify(pw, p.password_hash):
-                    patient_session(db, p); continue
+                plain_p = plain_db.query(PlainPatient).filter_by(user_id=uid).first()
+                if plain_p and argon2.verify(pw, plain_p.password_hash) and plain_p.secure_id:
+                    p = db.query(Patient).filter_by(id=plain_p.secure_id).first()
+                    if p:
+                        patient_session(db, plain_db, p, plain_p)
+                        continue
 
-                d = db.query(Doctor).filter_by(user_id=uid).first()
-                if d and argon2.verify(pw, d.password_hash):
-                    doctor_session(db, d); continue
+                plain_d = plain_db.query(PlainDoctor).filter_by(user_id=uid).first()
+                if plain_d and argon2.verify(pw, plain_d.password_hash) and plain_d.secure_id:
+                    d = db.query(Doctor).filter_by(id=plain_d.secure_id).first()
+                    if d:
+                        doctor_session(db, plain_db, d, plain_d)
+                        continue
 
                 print("Invalid credentials.")
 
         elif cmd == "2":
-            with SessionLocal() as db:
-                create_patient_account(db)
+            with SessionLocal() as db, PlainSessionLocal() as plain_db:
+                create_patient_account(db, plain_db)
 
         elif cmd == "3":
-            with SessionLocal() as db:
-                create_doctor_account(db)
+            with SessionLocal() as db, PlainSessionLocal() as plain_db:
+                create_doctor_account(db, plain_db)
 
         elif cmd == "4":
             print("Goodbye."); sys.exit(0)

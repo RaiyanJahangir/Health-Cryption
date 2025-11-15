@@ -17,9 +17,10 @@ from pathlib import Path
 
 from PIL import Image
 from sqlalchemy.orm import Session
+from passlib.hash import argon2
 
-from db import SessionLocal
-from models import Patient, Doctor, PatientDoctorAccess
+from db import SessionLocal, PlainSessionLocal
+from models import Patient, Doctor, PatientDoctorAccess, PlainPatient, PlainDoctor
 from crypto import (
     aesgcm_decrypt,
     unprotect_privkey_with_password,
@@ -67,15 +68,23 @@ def main():
 
     patient_id = input("Patient ID to open: ").strip()
 
-    with SessionLocal() as db:
+    with SessionLocal() as db, PlainSessionLocal() as plain_db:
         # find doctor & patient
-        d = db.query(Doctor).filter_by(user_id=doctor_uid).first()
-        if not d:
+        plain_doc = plain_db.query(PlainDoctor).filter_by(user_id=doctor_uid).first()
+        if not plain_doc or plain_doc.secure_id is None:
             print("Doctor not found."); sys.exit(1)
+        if not argon2.verify(doctor_pw, plain_doc.password_hash):
+            print("Invalid doctor credentials."); sys.exit(1)
+        d = db.query(Doctor).filter_by(id=plain_doc.secure_id).first()
+        if not d:
+            print("Doctor secure record missing."); sys.exit(1)
 
-        p = db.query(Patient).filter_by(patient_id=patient_id).first()
-        if not p:
+        plain_patient = plain_db.query(PlainPatient).filter_by(patient_id=patient_id).first()
+        if not plain_patient or plain_patient.secure_id is None:
             print("Patient not found."); sys.exit(1)
+        p = db.query(Patient).filter_by(id=plain_patient.secure_id).first()
+        if not p:
+            print("Patient secure record missing."); sys.exit(1)
 
         # unlock doctor's private key (X25519)
         try:
@@ -104,8 +113,10 @@ def main():
         breast_density = decrypt_text_field(patient_key, p.breast_density_nonce, p.breast_density_ct, "breast_density")
         findings       = decrypt_text_field(patient_key, p.findings_nonce,       p.findings_ct,       "findings")
 
+        pid_plain = decrypt_text_field(patient_key, p.patient_id_nonce, p.patient_id_ct, "patient_id")
+        uid_plain = decrypt_text_field(patient_key, p.user_id_nonce, p.user_id_ct, "user_id")
         print("\n=== Decrypted Patient Data ===")
-        print(f"patient_id: {p.patient_id} (login: {p.user_id})")
+        print(f"patient_id: {pid_plain} (login: {uid_plain or plain_patient.user_id})")
         print(f"Age:             {age!r}")
         print(f"BIRADS:          {birads!r}")
         print(f"Breast Density:  {breast_density!r}")
@@ -122,7 +133,7 @@ def main():
             except Exception:
                 print(f"[{tag}] decryption failed (tampered or wrong key).")
                 continue
-            outfile = Path(f"{p.patient_id}_{tag.replace('img:','').replace('-','_')}.png")
+            outfile = Path(f"{pid_plain}_{tag.replace('img:','').replace('-','_')}.png")
             outpath = save_png(img_bytes, outfile)
             print(f"[{tag}] saved -> {outpath}")
             saved_any = True
